@@ -1,8 +1,8 @@
 <!doctype html>
 <html lang="en">
 <head>
+<base href="https://cdn.jsdelivr.net/gh/Stratus-Games/Draw-A-Stickman-Epic-Webport@main/">
 <meta charset="utf-8" />
-  <base href="https://cdn.jsdelivr.net/gh/Stratus-Games/Draw-A-Stickman-Epic-Webport@main/">
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Draw a Stickman: EPIC</title>
 <style>
@@ -69,6 +69,27 @@
   var basePath = decodeURIComponent(new URL(base).pathname);
   // file:// pages report "file://" as their origin; new URL() agrees on Chrome.
   var pageOrigin = location.protocol === 'file:' ? 'file://' : location.origin;
+  // A <base href> may point somewhere else entirely (a CDN mirror). Everything
+  // the runtime asks for under that base is still answered from the archive, so
+  // the page keeps working wherever its html was placed.
+  var docBaseHref = document.baseURI || location.href;
+  var docBase = new URL('.', docBaseHref).href;
+  var docBasePath = decodeURIComponent(new URL(docBase).pathname);
+  var docBaseOrigin = new URL(docBase).protocol === 'file:' ? 'file://' : new URL(docBase).origin;
+  // Some host pages carry a <base href> pointing at a CDN mirror. Blazor feeds
+  // document.baseURI to its NavigationManager, which refuses a page URI outside
+  // that base, and every asset would be asked of the mirror. Pin the base to the
+  // page; keyOf() still maps mirror URLs onto archive keys.
+  if (docBase !== base) {
+    try {
+      Object.defineProperty(document, 'baseURI', {
+        configurable: true,
+        get: function () { return base; }
+      });
+      window.__REDEC_DOC_BASE__ = docBase;
+      trace('base href ' + docBase + ' pinned to ' + base);
+    } catch (e) { /* keep the document base */ }
+  }
   var files = new Map();
   var blobs = new Map();
   var engine = null;
@@ -78,7 +99,7 @@
   var pctEl = document.getElementById('redecPct');
   var booted = false;
   var traceOn = /(^|[?&])trace\b/.test(location.search);
-  var ONLY_HTTP = 'this split release needs its files beside it - build the one-file layout to run it from disk';
+  var ONLY_HTTP = 'game.redec not found - build the one-file layout, or put the parts next to the page or under the base href';
   var traceLeft = 80;
 
   function trace(msg, key) {
@@ -99,17 +120,61 @@
     if (label && splashSub) splashSub.textContent = label;
   }
 
+  function keyIn(u, origin, prefix) {
+    if (!u) return null;
+    var o = u.protocol === 'file:' ? 'file://' : u.origin;
+    if (o !== origin) return null;
+    var p = decodeURIComponent(u.pathname);
+    return p.indexOf(prefix) === 0 ? p.slice(prefix.length) : null;
+  }
+
   function keyOf(url) {
+    var s = String(url);
     try {
-      var u = new URL(String(url), location.href);
-      var origin = u.protocol === 'file:' ? 'file://' : u.origin;
-      if (origin !== pageOrigin) return null;
-      var p = decodeURIComponent(u.pathname);
-      if (p.indexOf(basePath) !== 0) return null;
-      return p.slice(basePath.length);
+      var k;
+      if (/^[a-z][a-z0-9+.-]*:/i.test(s)) {
+        // absolute: the page folder first, then the document's <base href>
+        var abs = new URL(s, location.href);
+        k = keyIn(abs, pageOrigin, basePath);
+        if (k === null) k = keyIn(abs, docBaseOrigin, docBasePath);
+        return k;
+      }
+      // relative: siblings of the page first (split release), then the base
+      k = keyIn(new URL(s, location.href), pageOrigin, basePath);
+      if (k === null && docBaseHref !== location.href) {
+        k = keyIn(new URL(s, docBaseHref), docBaseOrigin, docBasePath);
+      }
+      return k;
     } catch (e) {
       return null;
     }
+  }
+
+  // Relative URLs resolve against the <base> element inside the browser, not
+  // against the document.baseURI property we pin above, so the loader always
+  // builds URLs itself. Payload files are looked for beside the page first and
+  // then at the document base, which is how a page hosted elsewhere (or opened
+  // from disk) runs with its redec.wasm / parts on a CDN.
+  function pageUrl(name) {
+    return new URL(String(name), base).href;
+  }
+
+  function payloadUrls(name) {
+    var list = [pageUrl(name)];
+    var alt = docBaseHref !== location.href ? new URL(String(name), docBaseHref).href : null;
+    if (alt && alt !== list[0]) list.push(alt);
+    return list;
+  }
+
+  async function fetchPayload(name) {
+    var urls = payloadUrls(name);
+    for (var i = 0; i < urls.length; i++) {
+      try {
+        var r = await (nativeFetch || fetch)(urls[i], { cache: 'no-store' });
+        if (r.ok) return r;
+      } catch (e) { /* blocked (file://) or offline: try the next location */ }
+    }
+    return null;
   }
 
   // Blazor's loader resolves its boot config and runtime modules against the
@@ -193,7 +258,9 @@
   // --- fetch -------------------------------------------------------------
   var nativeFetch = window.fetch ? window.fetch.bind(window) : null;
   window.fetch = function (input, init) {
-    var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+    var raw = typeof input === 'string' ? input : (input && input.url) || String(input);
+    // bare-relative requests belong to the page, never to a CDN <base href>
+    var url = /^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : pageUrl(raw);
     var key = keyOf(url);
     var body = bodyFor(key);
     trace('fetch ' + (body ? 'hit ' : 'MISS ') + String(key || url).slice(0, 120), key);
@@ -201,7 +268,7 @@
     if (key && /dotnet\.native\.wasm$/.test(key) && engine) {
       return Promise.resolve(respond(engine, 'application/wasm'));
     }
-    if (nativeFetch) return nativeFetch(input, init);
+    if (nativeFetch) return nativeFetch(url, init);
     return Promise.reject(new Error('no fetch for ' + url));
   };
 
@@ -423,22 +490,19 @@
       if (!emb || !emb.length) throw new Error('embedded archive is empty');
       return { bytes: emb, parts: 0 };
     }
-    // A browser will not fetch sibling files from a file:// page, so a split
-    // release only runs when it is served.
-    if (location.protocol === 'file:') throw new Error(ONLY_HTTP);
-    var whole = await (nativeFetch || fetch)('game.redec', { cache: 'no-store' });
-    if (whole.ok) return { bytes: new Uint8Array(await whole.arrayBuffer()), parts: 1 };
+    var whole = await fetchPayload('game.redec');
+    if (whole) return { bytes: new Uint8Array(await whole.arrayBuffer()), parts: 1 };
     var chunks = [], total = 0;
     for (var i = 1; i <= 512; i++) {
-      var r = await (nativeFetch || fetch)('game.redec.part' + i, { cache: 'no-store' });
-      if (!r.ok) break;
+      var r = await fetchPayload('game.redec.part' + i);
+      if (!r) break;
       var b = new Uint8Array(await r.arrayBuffer());
       if (!b.byteLength) break;
       chunks.push(b);
       total += b.byteLength;
       progress(4 + Math.min(6, i), 'loading game.redec.part' + i + '…');
     }
-    if (!chunks.length) throw new Error('game.redec not found (no .part files either)');
+    if (!chunks.length) throw new Error(ONLY_HTTP + ' (' + payloadUrls('game.redec').join(' , ') + ')');
     var out = new Uint8Array(total), at = 0;
     for (var c = 0; c < chunks.length; c++) {
       out.set(chunks[c], at);
@@ -473,9 +537,8 @@
         engine = b64Bytes(inlineWasm.textContent) || new Uint8Array(0);
         if (!engine.length) throw new Error('embedded engine is empty');
       } else {
-        if (location.protocol === 'file:') throw new Error(ONLY_HTTP);
-        var wasm = await (nativeFetch || fetch)('redec.wasm', { cache: 'no-store' });
-        if (!wasm.ok) throw new Error('redec.wasm: HTTP ' + wasm.status);
+        var wasm = await fetchPayload('redec.wasm');
+        if (!wasm) throw new Error('redec.wasm not found (' + payloadUrls('redec.wasm').join(' , ') + ')');
         engine = new Uint8Array(await wasm.arrayBuffer());
       }
       progress(60, 'starting engine…');
