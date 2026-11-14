@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
   <base href="https://cdn.jsdelivr.net/gh/Stratus-Games/Draw-A-Stickman-Epic-Webport@main/">
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Draw a Stickman: EPIC</title>
 <style>
 
@@ -65,7 +65,10 @@
   var cfg = window.__REDEC_RELEASE__ || {};
   var MAGIC = 'REDEC1\n';
   var base = new URL('.', location.href).href;
-  var basePath = new URL(base).pathname;
+  // Decoded so paths with spaces (…/Epic 1/…) still match a decoded request path.
+  var basePath = decodeURIComponent(new URL(base).pathname);
+  // file:// pages report "file://" as their origin; new URL() agrees on Chrome.
+  var pageOrigin = location.protocol === 'file:' ? 'file://' : location.origin;
   var files = new Map();
   var blobs = new Map();
   var engine = null;
@@ -75,6 +78,7 @@
   var pctEl = document.getElementById('redecPct');
   var booted = false;
   var traceOn = /(^|[?&])trace\b/.test(location.search);
+  var ONLY_HTTP = 'this split release needs its files beside it - build the one-file layout to run it from disk';
   var traceLeft = 80;
 
   function trace(msg, key) {
@@ -98,7 +102,8 @@
   function keyOf(url) {
     try {
       var u = new URL(String(url), location.href);
-      if (u.origin !== location.origin) return null;
+      var origin = u.protocol === 'file:' ? 'file://' : u.origin;
+      if (origin !== pageOrigin) return null;
       var p = decodeURIComponent(u.pathname);
       if (p.indexOf(basePath) !== 0) return null;
       return p.slice(basePath.length);
@@ -309,6 +314,15 @@
   window.XMLHttpRequest = RedeXHR;
 
   // --- module mounting ---------------------------------------------------
+  // Every dynamic import must end up at a blob URL: on a file:// page the
+  // browser refuses to import a file:// module (CORS), while blob modules load
+  // fine. dotnet.js/dotnet.native.js are ES modules full of import(expr) calls,
+  // so wrap them at the source level and let __REDEC_MODULE resolve the path.
+  var IMPORT_CALL = /\bimport\(([A-Za-z_$][\w$]*)\)/g;
+  function wrapImports(text) {
+    return text.replace(IMPORT_CALL, 'import(window.__REDEC_MODULE($1))');
+  }
+
   function moduleUrl(path) {
     if (blobs.has(path)) return blobs.get(path);
     if (!files.has(path)) return null;
@@ -317,6 +331,7 @@
     // names and icudt.dat against it. Both live under _framework/ in the
     // archive, and dotnet.native.wasm is answered by our fetch shim.
     text = text.split('import.meta.url').join(JSON.stringify(base + '_framework/'));
+    text = wrapImports(text);
     var url = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
     blobs.set(path, url);
     return url;
@@ -331,6 +346,14 @@
     }
     return url;
   };
+  // Any import that slips past the wraps above still lands on a blob module.
+  window.__REDEC_IMPORT__ = function (spec) {
+    try {
+      return import(window.__REDEC_MODULE(spec));
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  };
 
   // --- scripts -----------------------------------------------------------
   function runScript(path) {
@@ -339,9 +362,9 @@
     var s = document.createElement('script');
     s.text = new TextDecoder().decode(data);
     if (/blazor\.webassembly\.js$/.test(path)) {
-      // route every dynamic module import through the archive
-      s.text = s.text.replace(/await import\(([A-Za-z_$][\w$]*)\)/g,
-        'await import(window.__REDEC_MODULE($1))');
+      // route every dynamic module import (dotnet.js and friends) through the
+      // archive instead of a sibling _framework/ folder that may not exist
+      s.text = wrapImports(s.text);
       s.setAttribute('autostart', 'false');
     }
     document.head.appendChild(s);
@@ -370,10 +393,39 @@
     setTimeout(function () { clearInterval(timer); ready(); }, 90000);
   }
 
+  // --- payload ------------------------------------------------------------
+  // A single-file release carries #redecEngine / #redecArchive as base64 text
+  // nodes in the page itself; decode them in chunks so huge archives do not
+  // allocate one enormous intermediate string.
+  function b64Bytes(text, onProgress) {
+    text = String(text || '').replace(/\s+/g, '');
+    if (!text) return null;
+    var step = 1 << 23; // 8 MiB, always a multiple of 4
+    var out = new Uint8Array(Math.floor((text.length * 3) / 4));
+    var at = 0;
+    for (var i = 0; i < text.length; i += step) {
+      var bin = atob(text.slice(i, Math.min(i + step, text.length)));
+      for (var j = 0; j < bin.length; j++) out[at++] = bin.charCodeAt(j);
+      if (onProgress) onProgress(i + step, text.length);
+    }
+    return at === out.length ? out : out.subarray(0, at);
+  }
+
   // --- archive ------------------------------------------------------------
-  // The data is either one game.redec or game.redec.part1..N pieces: fetch the
-  // parts in order, concatenate, then gunzip the joined stream.
+  // The data is one game.redec, game.redec.part1..N pieces, or an embedded
+  // #redecArchive: parts are concatenated, then the joined stream is gunzipped.
   async function loadArchive() {
+    var inline = document.getElementById('redecArchive');
+    if (inline) {
+      var emb = b64Bytes(inline.textContent, function (done, total) {
+        progress(4 + Math.round((done / total) * 7), 'unpacking archive…');
+      });
+      if (!emb || !emb.length) throw new Error('embedded archive is empty');
+      return { bytes: emb, parts: 0 };
+    }
+    // A browser will not fetch sibling files from a file:// page, so a split
+    // release only runs when it is served.
+    if (location.protocol === 'file:') throw new Error(ONLY_HTTP);
     var whole = await (nativeFetch || fetch)('game.redec', { cache: 'no-store' });
     if (whole.ok) return { bytes: new Uint8Array(await whole.arrayBuffer()), parts: 1 };
     var chunks = [], total = 0;
@@ -416,9 +468,16 @@
         files.set(f.p, bytes.subarray(dataStart + f.o, dataStart + f.o + f.s));
       });
       progress(45, 'loading engine…');
-      var wasm = await (nativeFetch || fetch)('redec.wasm', { cache: 'no-store' });
-      if (!wasm.ok) throw new Error('redec.wasm: HTTP ' + wasm.status);
-      engine = new Uint8Array(await wasm.arrayBuffer());
+      var inlineWasm = document.getElementById('redecEngine');
+      if (inlineWasm) {
+        engine = b64Bytes(inlineWasm.textContent) || new Uint8Array(0);
+        if (!engine.length) throw new Error('embedded engine is empty');
+      } else {
+        if (location.protocol === 'file:') throw new Error(ONLY_HTTP);
+        var wasm = await (nativeFetch || fetch)('redec.wasm', { cache: 'no-store' });
+        if (!wasm.ok) throw new Error('redec.wasm: HTTP ' + wasm.status);
+        engine = new Uint8Array(await wasm.arrayBuffer());
+      }
       progress(60, 'starting engine…');
 
       var scripts = manifest.scripts && manifest.scripts.length ? manifest.scripts : [
